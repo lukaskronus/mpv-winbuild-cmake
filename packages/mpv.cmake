@@ -23,6 +23,7 @@ ExternalProject_Add(mpv
         vapoursynth
         libsdl2
     GIT_REPOSITORY https://github.com/mpv-player/mpv.git
+    PATCH_COMMAND git apply --verbose ${CMAKE_SOURCE_DIR}/patches/mpv-pr15612.patch
     SOURCE_DIR ${SOURCE_LOCATION}
     GIT_CLONE_FLAGS "--filter=tree:0"
     UPDATE_COMMAND ""

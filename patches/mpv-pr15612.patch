@@ -1,0 +1,48 @@
+From 08b76cbcdf03e08d1a6fb67c8323f9cd13f950b9 Mon Sep 17 00:00:00 2001
+From: Nicolas F <ovdev@fratti.ch>
+Date: Wed, 1 Jan 2025 21:48:51 +0100
+Subject: [PATCH] ytdl_hook: use the new max_requested_size AVOption if needed
+
+Some sites throttle requests, but throttling can be avoided with
+many small range requests. yt-dlp implements a "http_chunk_size"
+key in its -J output to inform us of the ideal size.
+
+With the appropriate[1] FFmpeg addition, we can properly implement
+this now, which greatly speeds up how fast YouTube videos get loaded
+into the cache by mpv.
+
+Should the FFmpeg that mpv is built against lack the max_requested_size
+AVOption, then this will silently not do anything new, so no version checks are
+needed.
+
+Fixes #8655.
+
+[1]: https://patchwork.ffmpeg.org/project/ffmpeg/patch/20250329222809.606230-2-ffmpeg@fratti.ch/
+---
+ player/lua/ytdl_hook.lua | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/player/lua/ytdl_hook.lua b/player/lua/ytdl_hook.lua
+index 7090d89736b6d..2e244c2845079 100644
+--- a/player/lua/ytdl_hook.lua
++++ b/player/lua/ytdl_hook.lua
+@@ -887,6 +887,18 @@ local function add_single_video(json)
+         stream_opts["cookies"] = serialize_cookies_for_avformat(existing_cookies)
+     end
+ 
++    local chunk_size = math.huge
++    if has_requested_formats then
++        for _, f in pairs(requested_formats) do
++            if f.downloader_options and f.downloader_options.http_chunk_size then
++                chunk_size = math.min(chunk_size, tonumber(f.downloader_options.http_chunk_size))
++            end
++        end
++    end
++    if chunk_size < math.huge then
++        stream_opts = append_libav_opt(stream_opts, "max_requested_size", tostring(chunk_size))
++    end
++
+     mp.set_property_native("file-local-options/stream-lavf-o", stream_opts)
+ end
+ 
+

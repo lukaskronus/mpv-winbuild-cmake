@@ -1,0 +1,150 @@
+From patchwork Sat Mar 29 22:28:10 2025
+Content-Type: text/plain; charset="utf-8"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+X-Patchwork-Submitter: Nicolas Frattaroli <ffmpeg@fratti.ch>
+X-Patchwork-Id: 54511
+Return-Path: <ffmpeg-devel-bounces@ffmpeg.org>
+X-Original-To: ffmpeg-patchwork@ffmpeg.org
+Delivered-To: ffmpeg-patchwork@ffmpeg.org
+Received: from [127.0.1.1] (localhost [127.0.0.1])
+	by ffbox0-bg.mplayerhq.hu (Postfix) with ESMTP id 49B20687C9E;
+	Sun, 30 Mar 2025 00:30:31 +0200 (EET)
+X-Original-To: ffmpeg-devel@ffmpeg.org
+Delivered-To: ffmpeg-devel@ffmpeg.org
+Received: from fratti.ch (i.am.not.fratti.ch [148.251.88.14])
+ by ffbox0-bg.mplayerhq.hu (Postfix) with ESMTPS id 08C41687B41
+ for <ffmpeg-devel@ffmpeg.org>; Sun, 30 Mar 2025 00:30:25 +0200 (EET)
+DKIM-Signature: v=1; a=rsa-sha256; c=simple/simple; d=fratti.ch; s=mail;
+ t=1743287424; bh=bebjqDoNro7ZSnuIGTec7xya1nkhNXv4d4XANmt/Yk4=;
+ h=From:To:Cc:Subject:Date:From;
+ b=r0hq/coHZHxG4Z9t6i1Lesui0waYOFUF7Ff4OhCV9yxMpuuVWtzSw06xAfYC9yn/p
+ mSO0dDB4wd2Zgt+Rw7kpHqeeyDiwZQ1LlTBo/QD0zXD5rkRagM02S46soQmIJxWfHd
+ I3WgqTtMdgXlehY20eJVmVTcrEGopaGcW14YSskk=
+From: Nicolas Frattaroli <ffmpeg@fratti.ch>
+To: ffmpeg-devel@ffmpeg.org
+Date: Sat, 29 Mar 2025 23:28:10 +0100
+Message-ID: <20250329222809.606230-2-ffmpeg@fratti.ch>
+X-Mailer: git-send-email 2.49.0
+MIME-Version: 1.0
+Subject: [FFmpeg-devel] [PATCH v2] avformat/http: Add max_requested_size
+ option
+X-BeenThere: ffmpeg-devel@ffmpeg.org
+X-Mailman-Version: 2.1.29
+Precedence: list
+List-Id: FFmpeg development discussions and patches <ffmpeg-devel.ffmpeg.org>
+List-Unsubscribe: <https://ffmpeg.org/mailman/options/ffmpeg-devel>,
+ <mailto:ffmpeg-devel-request@ffmpeg.org?subject=unsubscribe>
+List-Archive: <https://ffmpeg.org/pipermail/ffmpeg-devel>
+List-Post: <mailto:ffmpeg-devel@ffmpeg.org>
+List-Help: <mailto:ffmpeg-devel-request@ffmpeg.org?subject=help>
+List-Subscribe: <https://ffmpeg.org/mailman/listinfo/ffmpeg-devel>,
+ <mailto:ffmpeg-devel-request@ffmpeg.org?subject=subscribe>
+Reply-To: FFmpeg development discussions and patches <ffmpeg-devel@ffmpeg.org>
+Cc: "Ronald S . Bultje" <rsbultje@gmail.com>,
+ Nicolas Frattaroli <ffmpeg@fratti.ch>, Lynne <dev@lynne.ee>
+Errors-To: ffmpeg-devel-bounces@ffmpeg.org
+Sender: "ffmpeg-devel" <ffmpeg-devel-bounces@ffmpeg.org>
+
+In some cases, webservers may return content more quickly if one sends many
+small requests rather than one big request. Clients may wish to opt-in to this
+workaround.
+
+For this purpose, add a max_requested_size AVOption, which returns EOF if
+max_requested_size is exceeded, causing a new request with an offset to be
+issued.
+
+In particular, this hack is useful for mpv, where it can be used to bypass
+YouTube's throttling.
+
+Signed-off-by: Nicolas Frattaroli <ffmpeg@fratti.ch>
+---
+Changes in v2:
+ - Renamed option from max_request_size to max_requested_size
+---
+ libavformat/http.c | 43 +++++++++++++++++++++++++++++++------------
+ 1 file changed, 31 insertions(+), 12 deletions(-)
+
+diff --git a/libavformat/http.c b/libavformat/http.c
+index 65ea5d993c..bcb4e0f4c4 100644
+--- a/libavformat/http.c
++++ b/libavformat/http.c
+@@ -77,7 +77,7 @@ typedef struct HTTPContext {
+     /* Used if "Transfer-Encoding: chunked" otherwise -1. */
+     uint64_t chunksize;
+     int chunkend;
+-    uint64_t off, end_off, filesize;
++    uint64_t off, end_off, filesize, max_requested_size, range_end;
+     char *uri;
+     char *location;
+     HTTPAuthState auth_state;
+@@ -176,6 +176,7 @@ static const AVOption options[] = {
+     { "location", "The actual location of the data received", OFFSET(location), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D | E },
+     { "offset", "initial byte offset", OFFSET(off), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, D },
+     { "end_offset", "try to limit the request to bytes preceding this offset", OFFSET(end_off), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, D },
++    { "max_requested_size", "try to limit the request to this many bytes, then reconnect", OFFSET(max_requested_size), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, D },
+     { "method", "Override the HTTP method or set the expected HTTP method from a client", OFFSET(method), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, D | E },
+     { "reconnect", "auto reconnect after disconnect before EOF", OFFSET(reconnect), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
+     { "reconnect_at_eof", "auto reconnect at EOF", OFFSET(reconnect_at_eof), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, D },
+@@ -1524,10 +1525,16 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
+     // Note: we send the Range header on purpose, even when we're probing,
+     // since it allows us to detect more reliably if a (non-conforming)
+     // server supports seeking by analysing the reply headers.
+-    if (!has_header(s->headers, "\r\nRange: ") && !post && (s->off > 0 || s->end_off || s->seekable != 0)) {
++    if (!has_header(s->headers, "\r\nRange: ") && !post && (s->off > 0 || s->end_off || s->seekable != 0 || s->max_requested_size)) {
+         av_bprintf(&request, "Range: bytes=%"PRIu64"-", s->off);
+-        if (s->end_off)
+-            av_bprintf(&request, "%"PRId64, s->end_off - 1);
++        if (s->end_off || s->max_requested_size) {
++            if (s->end_off && s->max_requested_size) {
++                s->range_end = FFMIN(s->end_off, s->off + s->max_requested_size);
++            } else {
++                s->range_end = FFMAX(s->end_off, s->off + s->max_requested_size);
++            }
++            av_bprintf(&request, "%"PRId64, s->range_end - 1);
++        }
+         av_bprintf(&request, "\r\n");
+     }
+     if (send_expect_100 && !has_header(s->headers, "\r\nExpect: "))
+@@ -1666,7 +1673,16 @@ static int http_buf_read(URLContext *h, uint8_t *buf, int size)
+         memcpy(buf, s->buf_ptr, len);
+         s->buf_ptr += len;
+     } else {
+-        uint64_t target_end = s->end_off ? s->end_off : s->filesize;
++        uint64_t target_end = s->filesize;
++        if (s->end_off || s->max_requested_size) {
++            if (s->end_off && s->max_requested_size) {
++                target_end = FFMIN(s->end_off, s->range_end);
++            } else {
++                target_end = FFMAX(s->end_off, s->range_end);
++            }
++            target_end = FFMIN(target_end, s->filesize);
++        }
++
+         if ((!s->willclose || s->chunksize == UINT64_MAX) && s->off >= target_end)
+             return AVERROR_EOF;
+         len = ffurl_read(s->hd, buf, size);
+@@ -1769,13 +1785,16 @@ static int http_read_stream(URLContext *h, uint8_t *buf, int size)
+             reconnect_delay_total > s->reconnect_delay_total_max)
+             return AVERROR(EIO);
+ 
+-        av_log(h, AV_LOG_WARNING, "Will reconnect at %"PRIu64" in %d second(s), error=%s.\n", s->off, reconnect_delay, av_err2str(read_ret));
+-        err = ff_network_sleep_interruptible(1000U*1000*reconnect_delay, &h->interrupt_callback);
+-        if (err != AVERROR(ETIMEDOUT))
+-            return err;
+-        reconnect_delay_total += reconnect_delay;
+-        reconnect_delay = 1 + 2*reconnect_delay;
+-        conn_attempts++;
++        if (!(s->max_requested_size > 0 && read_ret == AVERROR_EOF)) {
++            av_log(h, AV_LOG_WARNING, "Will reconnect at %"PRIu64" in %d second(s), error=%s.\n",
++                   s->off, reconnect_delay, av_err2str(read_ret));
++            err = ff_network_sleep_interruptible(1000U*1000*reconnect_delay, &h->interrupt_callback);
++            if (err != AVERROR(ETIMEDOUT))
++                return err;
++            reconnect_delay_total += reconnect_delay;
++            reconnect_delay = 1 + 2*reconnect_delay;
++            conn_attempts++;
++        }
+         seek_ret = http_seek_internal(h, target, SEEK_SET, 1);
+         if (seek_ret >= 0 && seek_ret != target) {
+             av_log(h, AV_LOG_ERROR, "Failed to reconnect at %"PRIu64".\n", target);
